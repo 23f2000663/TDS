@@ -1,118 +1,52 @@
 import json
-import math
 from pathlib import Path
-from typing import List
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
 
 app = FastAPI()
-
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Explicit OPTIONS handler
-@app.options("/api")
-def options_api():
-    return Response(
-        status_code=204,
-        headers={
-            "Access-Control-Allow-Origin": "*",
-            "Access-Control-Allow-Methods": "POST, OPTIONS",
-            "Access-Control-Allow-Headers": "*",
-        },
-    )
-
-# Load JSON data
-DATA_FILE = Path(__file__).resolve().parent.parent / "q-vercel-latency.json"
-
-with open(DATA_FILE, "r", encoding="utf-8") as f:
-    data = json.load(f)
+DATA = json.loads((Path(__file__).parent.parent / "q-vercel-latency.json").read_text())
 
 
-class RequestBody(BaseModel):
-    regions: List[str]
-    threshold_ms: float
+def percentile(values, q):
+    v = sorted(values)
+    pos = (len(v) - 1) * q
+    lo = int(pos)
+    frac = pos - lo
+    return v[lo] + frac * (v[lo + 1] - v[lo]) if lo + 1 < len(v) else v[lo]
 
 
-def percentile_95(values):
-    values = sorted(values)
-
-    if not values:
-        return None
-
-    pos = 0.95 * (len(values) - 1)
-
-    lower = math.floor(pos)
-    upper = math.ceil(pos)
-
-    if lower == upper:
-        return values[lower]
-
-    return values[lower] + (
-        values[upper] - values[lower]
-    ) * (pos - lower)
-
-
-@app.post("/api")
-def latency_stats(body: RequestBody):
-    results = {}
-
-    for region in body.regions:
-        rows = [
-            row
-            for row in data
-            if row["region"] == region
-        ]
-
-        latencies = [
-            row["latency_ms"]
-            for row in rows
-        ]
-
-        uptimes = [
-            row["uptime_pct"]
-            for row in rows
-        ]
-
-        if not rows:
-            results[region] = {
-                "avg_latency": None,
-                "p95_latency": None,
-                "avg_uptime": None,
-                "breaches": 0,
-            }
+@app.post("/{path:path}")
+async def latency(request: Request, path: str = ""):
+    body = await request.json()
+    regions = body.get("regions", [])
+    threshold = body.get("threshold_ms", 180)
+    out = []
+    for region in regions:
+        recs = [r for r in DATA if r["region"] == region]
+        if not recs:
+            out.append({"region": region, "avg_latency": 0, "p95_latency": 0, "avg_uptime": 0, "breaches": 0})
             continue
-
-        results[region] = {
-            "avg_latency": sum(latencies) / len(latencies),
-            "p95_latency": percentile_95(latencies),
-            "avg_uptime": sum(uptimes) / len(uptimes),
-            "breaches": sum(
-                1
-                for latency in latencies
-                if latency > body.threshold_ms
-            ),
-        }
-
-    return Response(
-        content=json.dumps(results),
-        media_type="application/json",
-        headers={
-            "Access-Control-Allow-Origin": "*"
-        },
-    )
+        lat = [r["latency_ms"] for r in recs]
+        up = [r["uptime_pct"] for r in recs]
+        out.append({
+            "region": region,
+            "avg_latency": round(sum(lat) / len(lat), 2),
+            "p95_latency": round(percentile(lat, 0.95), 2),
+            "avg_uptime": round(sum(up) / len(up), 3),
+            "breaches": sum(1 for x in lat if x > threshold),
+        })
+    return JSONResponse({"regions": out}, headers={"Access-Control-Allow-Origin": "*"})
 
 
-@app.get("/")
-def home():
-    return {
-        "status": "ok"
-    }
+@app.get("/{path:path}")
+def health(path: str = ""):
+    return {"ok": True, "records": len(DATA)}
